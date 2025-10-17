@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pinball Wizard Tool</title>
+  <style>
+    :root {
+      --c64-border: #2a2188;
+      --c64-screen: #5f5fd3;
+      --c64-text: #b8b8ff;
+      --c64-ok: #a8c4ff;
+      --c64-err: #ff4d4d;
+    }
+    html, body { height: 100%; margin: 0; font-family: monospace; background: var(--c64-border); color: var(--c64-text); }
+    .screen { margin: 32px auto; max-width: 1000px; padding: 60px; background: var(--c64-screen); border: 60px solid var(--c64-border); }
+    h1 { text-align: center; text-transform: uppercase; margin-top: 0; }
+    .row { display: flex; gap: 12px; align-items: center; margin: 10px 0; flex-wrap: wrap; }
+    select, input[type="text"], input[type="file"], button {
+      background: #2f2fa2; color: var(--c64-text);
+      border: 2px solid var(--c64-border); padding: 6px 10px; cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .terminal {
+      background: #231b76; border: 2px solid var(--c64-border);
+      padding: 8px; width: 100%; min-height: 20em; max-height: 40em;
+      overflow-y: auto; white-space: pre-wrap; font-size: 14px; line-height: 1.2em;
+    }
+    #terminalInput { flex: 1; min-width: 300px; }
+    .scrollLockBox { display: flex; align-items: center; gap: 8px; margin-top: 4px; user-select: none; }
+    .input-ok { color: var(--c64-ok); border-color: #8ea6ff; }
+    .input-err { color: var(--c64-err); border-color: var(--c64-err); }
+  </style>
+</head>
+<body>
+  <div class="screen">
+    <h1>Pinball Wizard 2025 Tool</h1>
+
+    <div class="row">
+      <button id="connectBtn">Port wählen & verbinden (115200)</button>
+      <button id="disconnectBtn" disabled>Trennen</button>
+      <span id="status">Status: </span>
+    </div>
+
+    <div class="row">
+      <label for="fwSelect">Firmware</label>
+      <select id="fwSelect">
+        <option value="pbw25-stable">PBW25-stable</option>
+        <option value="pbw25-nightly">PBW25-nightly</option>
+        <option value="pedal-stable">PEDAL-stable</option>
+        <option value="pedal-nightly">PEDAL-nightly</option>
+        <option value="custom">Custom</option>
+      </select>
+      <button id="flashBtn">Flashen</button>
+      <button id="clearNvsBtn">CLEAR NVS NOW</button>
+      <span id="flashStatus">Bereit</span>
+    </div>
+
+    <div id="customRow" class="row" style="display:none;">
+      <label for="customFile">Custom Firmware</label>
+      <input type="file" id="customFile" accept=".bin" />
+    </div>
+
+    <div class="row">
+      <label for="macInput">ESPNOW MAC</label>
+      <input type="text" id="macInput" value="00:00:00:00:00:00" />
+      <button id="sendMacBtn">Senden</button>
+    </div>
+
+    <div class="row" style="flex-direction:column; align-items:flex-start;">
+      <span>Terminal</span>
+      <div id="terminalView" class="terminal"></div>
+      <div class="scrollLockBox">
+        <input type="checkbox" id="scrollLockChk" />
+        <span>Scroll Lock</span>
+      </div>
+    </div>
+
+    <div class="row" style="justify-content:flex-start;">
+      <input type="text" id="terminalInput" placeholder="UART Befehl..." />
+      <button id="sendTermBtn">Senden</button>
+    </div>
+  </div>
+
+  <script type="module">
+    import { ESPLoader, Transport } from "./bundle.js";   // "https://unpkg.com/esptool-js@0.4.2/bundle.js"  // use my library java file with stub support
+
+    // Polyfills und Buffer-Helpers
+    (function () {
+      function base64ToUint8Array(b64) {
+        const bin = atob(b64);
+        const arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        return arr;
+      }
+      function ensureUint8ArrayCompat(data) {
+        if (data instanceof Uint8Array) return data;
+        if (data instanceof ArrayBuffer) return new Uint8Array(data);
+        if (Array.isArray(data)) return new Uint8Array(data);
+        if (typeof data === "string") return new TextEncoder().encode(data);
+        return new Uint8Array(data);
+      }
+      if (typeof window.Buffer === "undefined") window.Buffer = {};
+      if (typeof Buffer.from !== "function") {
+        Buffer.from = (data, enc) => {
+          if (enc === "base64") return base64ToUint8Array(data);
+          return ensureUint8ArrayCompat(data);
+        };
+      }
+      if (typeof Buffer.concat !== "function") {
+        Buffer.concat = (list) => {
+          const arrays = list.map(ensureUint8ArrayCompat);
+          let total = arrays.reduce((a, b) => a + b.length, 0);
+          const out = new Uint8Array(total);
+          let offset = 0;
+          for (const a of arrays) { out.set(a, offset); offset += a.length; }
+          return out;
+        };
+      }
+      if (typeof Buffer.isBuffer !== "function") {
+        Buffer.isBuffer = (obj) => obj instanceof Uint8Array;
+      }
+    })();
+
+    // Strikte Typ-Sicherung für Firmware-Daten
+    function ensureUint8Array(buf) {
+      if (buf instanceof Uint8Array) return buf;
+      if (buf instanceof ArrayBuffer) return new Uint8Array(buf);
+      if (Array.isArray(buf)) return new Uint8Array(buf);
+      if (typeof buf === "string") return new TextEncoder().encode(buf);
+      try { return new Uint8Array(buf); } catch (e) {
+        throw new Error("Ungültiger Firmware-Puffer: erwartet Uint8Array/ArrayBuffer/Array/String");
+      }
+    }
+
+    let portTerminal, reader, writer;
+    let portFlash;
+    let mode = "terminal";
+    let autoScroll = true;
+
+    const statusEl = document.getElementById('status');
+    const terminalView = document.getElementById('terminalView');
+    const macInput = document.getElementById('macInput');
+    const scrollLockChk = document.getElementById('scrollLockChk');
+    const flashStatusEl = document.getElementById('flashStatus');
+    const customFile = document.getElementById('customFile');
+    const fwSelect = document.getElementById('fwSelect');
+    const disconnectBtn = document.getElementById('disconnectBtn');
+    const flashBtn = document.getElementById('flashBtn');
+
+    function appendTerminal(text) {
+      text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      terminalView.textContent += text;
+      const lines = terminalView.textContent.split(/\n/);
+      if (lines.length > 1000) terminalView.textContent = lines.slice(-1000).join("\n");
+      if (autoScroll) terminalView.scrollTop = terminalView.scrollHeight;
+    }
+
+
+    async function connectSerial() {
+      try {
+        portTerminal = await navigator.serial.requestPort();
+        await portTerminal.open({ baudRate: 115200 });
+        mode = "terminal";
+        statusEl.textContent = "Status: Verbunden (115200)";
+        disconnectBtn.disabled = false;
+        reader = portTerminal.readable.getReader();
+        writer = portTerminal.writable.getWriter();
+        readLoop();
+        appendTerminal("[Info] Terminal-Verbindung hergestellt\n");
+      } catch (e) {
+        appendTerminal("[Fehler] " + (e?.message || e) + "\n");
+      }
+    }
+
+    async function disconnectSerial() {
+      try {
+        if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); reader = null; }
+        if (writer) { writer.releaseLock(); writer = null; }
+        if (portTerminal && portTerminal.readable) { await portTerminal.close(); }
+      } catch (e) {
+        appendTerminal("[Trennungsfehler] " + (e?.message || e) + "\n");
+      }
+      statusEl.textContent = "Status: Nicht verbunden";
+      disconnectBtn.disabled = true;
+      portTerminal = null;
+      appendTerminal("[Info] Terminal-Verbindung getrennt\n");
+    }
+
+    async function readLoop() {
+      const decoder = new TextDecoder();
+      while (mode === "terminal" && reader) {
+        try {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value) appendTerminal(decoder.decode(value));
+        } catch {
+          break;
+        }
+      }
+    }
+
+    async function sendLine(line) {
+      if (!writer || mode !== "terminal") { appendTerminal("[Nicht verbunden. Erst oben Port waehlen und verbinden.]\n"); return; }
+      appendTerminal("> " + line + "\n");
+      const data = new TextEncoder().encode(line + "\n");
+      try { await writer.write(data); }
+      catch (e) { appendTerminal("[Schreibfehler] " + (e?.message || e) + "\n"); }
+    }
+
+    function validateMac(v) {
+      return /^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$/.test(v.trim());
+    }
+
+    function updateMacStyle() {
+      const ok = validateMac(macInput.value);
+      macInput.classList.toggle("input-ok", ok);
+      macInput.classList.toggle("input-err", !ok);
+    }
+
+    macInput.addEventListener("input", updateMacStyle);
+    updateMacStyle();
+
+    document.getElementById("connectBtn").onclick = connectSerial;
+    document.getElementById("disconnectBtn").onclick = disconnectSerial;
+
+    document.getElementById("sendTermBtn").onclick = () => {
+      const val = document.getElementById("terminalInput").value.trim();
+      if (val) {
+        sendLine(val);
+        document.getElementById("terminalInput").value = "";
+      }
+    };
+    document.getElementById("terminalInput").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") document.getElementById("sendTermBtn").click();
+    });
+
+    document.getElementById("sendMacBtn").onclick = () => {
+      const v = macInput.value.trim();
+      if (validateMac(v)) sendLine("mac=" + v.toUpperCase());
+      else appendTerminal("[MAC ungültig]\n");
+    };
+
+    document.getElementById("clearNvsBtn").onclick = () => {
+      sendLine("nvs_clean");
+    };
+
+    scrollLockChk.addEventListener("change", () => {
+      autoScroll = !scrollLockChk.checked;
+    });
+
+    fwSelect.addEventListener("change", () => {
+      document.getElementById("customRow").style.display =
+        fwSelect.value === "custom" ? "flex" : "none";
+    });
+
+    async function fetchBinaryWithFallback(localPath, remoteUrl) {
+      if (localPath) {
+        try {
+          const r = await fetch(localPath, { cache: "no-store" });
+          if (r.ok) return await r.arrayBuffer();
+        } catch (_) {}
+      }
+      if (remoteUrl) {
+        const r = await fetch(remoteUrl, { cache: "no-store" });
+        if (!r.ok) throw new Error("Remote-Download fehlgeschlagen: " + r.status);
+        return await r.arrayBuffer();
+      }
+      throw new Error("Kein Firmware-Quellpfad verfügbar.");
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+flashBtn.addEventListener("click", async () => {
+  flashStatusEl.textContent = "Flash: Vorbereitung…";
+  flashBtn.disabled = true;
+
+  try {
+    // Terminal-Session trennen
+    mode = "flash";
+    if (reader) { await reader.cancel().catch(() => {}); reader.releaseLock(); reader = null; }
+    if (writer) { writer.releaseLock(); writer = null; }
+    if (portTerminal && portTerminal.readable) { await portTerminal.close().catch(() => {}); }
+    appendTerminal("[Info] Terminal getrennt, bitte Port für Flash auswählen…\n");
+
+    // Port neu auswählen
+    try {
+      portFlash = await navigator.serial.requestPort();
+    } catch (e) {
+      appendTerminal("[Flash-Fehler] Kein Port ausgewählt\n");
+      throw e;
+    }
+
+    // Firmware laden
+    const channel = fwSelect.value;
+    let buf, label, bootloaderBuf, partitionsBuf;
+
+    if (channel === "pbw25-stable") {
+      label = "PBW25-stable";
+      buf = await fetchBinaryWithFallback("./pbw25-stable.bin",
+        "https://raw.githubusercontent.com/youruser/yourrepo/main/firmware/pbw25-stable.bin");
+      bootloaderBuf = await fetchBinaryWithFallback("./bootloader.bin",
+        "https://raw.githubusercontent.com/youruser/yourrepo/main/firmware/bootloader.bin");
+      partitionsBuf = await fetchBinaryWithFallback("./partitions.bin",
+        "https://raw.githubusercontent.com/youruser/yourrepo/main/firmware/partitions.bin");
+    } else if (channel === "pbw25-nightly") {
+      label = "PBW25-nightly";
+      buf = await fetchBinaryWithFallback("./pbw25-nightly.bin",
+        "https://raw.githubusercontent.com/youruser/yourrepo/main/firmware/pbw25-nightly.bin");
+      bootloaderBuf = await fetchBinaryWithFallback("./bootloader.bin",
+        "https://raw.githubusercontent.com/youruser/yourrepo/main/firmware/bootloader.bin");
+      partitionsBuf = await fetchBinaryWithFallback("./partitions.bin",
+        "https://raw.githubusercontent.com/youruser/yourrepo/main/firmware/partitions.bin");
+    } else if (channel === "pedal-stable") {
+      label = "PEDAL-stable";
+      buf = await fetchBinaryWithFallback("./pedal-stable.bin",
+        "https://raw.githubusercontent.com/youruser/yourrepo/main/firmware/pedal-stable.bin");
+      bootloaderBuf = await fetchBinaryWithFallback("./bootloader.bin",
+        "https://raw.githubusercontent.com/youruser/yourrepo/main/firmware/bootloader.bin");
+      partitionsBuf = await fetchBinaryWithFallback("./partitions.bin",
+        "https://raw.githubusercontent.com/youruser/yourrepo/main/firmware/partitions.bin");
+    } else if (channel === "pedal-nightly") {
+      label = "PEDAL-nightly";
+      buf = await fetchBinaryWithFallback("./pedal-nightly.bin",
+        "https://raw.githubusercontent.com/youruser/yourrepo/main/firmware/pedal-nightly.bin");
+      bootloaderBuf = await fetchBinaryWithFallback("./bootloader.bin",
+        "https://raw.githubusercontent.com/youruser/yourrepo/main/firmware/bootloader.bin");
+      partitionsBuf = await fetchBinaryWithFallback("./partitions.bin",
+        "https://raw.githubusercontent.com/youruser/yourrepo/main/firmware/partitions.bin");
+    } else {
+      const file = customFile.files[0];
+      if (!file) {
+        flashStatusEl.textContent = "Flash: Keine Custom-Datei ausgewählt";
+        flashBtn.disabled = false;
+        return;
+      }
+      label = file.name || "custom";
+      buf = await file.arrayBuffer();
+
+      // Optional: versuche trotzdem Bootloader & Partitions zu laden
+      bootloaderBuf = await fetchBinaryWithFallback("./bootloader.bin", null).catch(() => null);
+      partitionsBuf = await fetchBinaryWithFallback("./partitions.bin", null).catch(() => null);
+    }
+
+    // Debug-Ausgabe
+    appendTerminal(`[Debug] BootloaderBuf: ${bootloaderBuf?.byteLength || 0} Bytes\n`);
+    appendTerminal(`[Debug] PartitionsBuf: ${partitionsBuf?.byteLength || 0} Bytes\n`);
+
+    await flashFirmware(buf, label, bootloaderBuf, partitionsBuf);
+    flashStatusEl.textContent = "Flash: Erfolgreich";
+    appendTerminal("[Hinweis] Flash abgeschlossen. Für Live-UART bitte oben auf 'Port wählen & verbinden' klicken.\n");
+
+  } catch (e) {
+    flashStatusEl.textContent = "Flash: Fehler";
+    appendTerminal("[Flash-Fehler] " + (e?.message || e) + "\n");
+    console.error(e);
+  } finally {
+    flashBtn.disabled = false;
+    try { if (portFlash) await portFlash.close(); } catch {}
+    portFlash = null;
+    mode = "terminal";
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+async function flashFirmware(arrayBuffer, label, bootloaderBuf, partitionsBuf) {
+  appendTerminal(`[Flash] Start: ${label} (${arrayBuffer.byteLength} Bytes)\n`);
+
+  if (typeof ESPLoader === 'undefined' || typeof Transport === 'undefined') {
+    throw new Error("ESPLoader oder Transport nicht verfügbar");
+  }
+
+  const transport = new Transport(portFlash, true);
+  const baud = 115200;
+
+  flashStatusEl.textContent = `Flash: Chip-Erkennung @ ${baud} Baud…`;
+  appendTerminal(`[Flash] Versuche Verbindung mit ${baud} Baud\n`);
+
+  const esploader = new ESPLoader({
+    transport: transport,
+    baudrate: baud,
+    terminal: {
+      clean: () => {},
+      writeLine: (text) => appendTerminal(text + "\n"),
+      write: (text) => appendTerminal(text)
+    }
+  });
+
+  try {
+    await esploader.main();
+    appendTerminal("[Flash] Chip erkannt, Stub läuft\n");
+  } catch (stubErr) {
+    appendTerminal(`[Flash] Stub-Upload fehlgeschlagen: ${stubErr?.message || stubErr}\n`);
+    throw new Error("Stub benötigt für Flash-Operation");
+  }
+
+  // Alle Binaries konvertieren
+  appendTerminal(`[Flash] Konvertiere Binaries für Library...\n`);
+  
+  const fileArray = [];
+  
+  // Bootloader @ 0x1000 (optional)
+  if (1) {    // bootloaderBuf
+    const bootloaderData = new Uint8Array(bootloaderBuf);
+    let bootloaderString = '';
+    for (let i = 0; i < bootloaderData.length; i++) {
+      bootloaderString += String.fromCharCode(bootloaderData[i]);
+    }
+    fileArray.push({ data: bootloaderString, address: 0x1000 });
+    appendTerminal(`[Flash] + Bootloader @ 0x1000 (${bootloaderData.length} Bytes)\n`);
+  }
+
+  // Partitions @ 0x8000 (optional)
+  if (1) {   // partitionsBuf
+    const partitionsData = new Uint8Array(partitionsBuf);
+    let partitionsString = '';
+    for (let i = 0; i < partitionsData.length; i++) {
+      partitionsString += String.fromCharCode(partitionsData[i]);
+    }
+    fileArray.push({ data: partitionsString, address: 0x8000 });
+    appendTerminal(`[Flash] + Partitions @ 0x8000 (${partitionsData.length} Bytes)\n`);
+  }
+
+  // App @ 0x10000 (immer)
+  const appData = new Uint8Array(arrayBuffer);
+  let appString = '';
+  for (let i = 0; i < appData.length; i++) {
+    appString += String.fromCharCode(appData[i]);
+  }
+  fileArray.push({ data: appString, address: 0x10000 });
+  appendTerminal(`[Flash] + App @ 0x10000 (${appData.length} Bytes)\n`);
+
+  flashStatusEl.textContent = "Flash: Schreibe Firmware…";
+  appendTerminal(`[Flash] Schreibe ${fileArray.length} Binary/Binaries...\n`);
+
+  try {
+    await esploader.writeFlash({
+      fileArray: fileArray,
+      flashSize: "keep",
+      eraseAll: false,
+      compress: true,
+      reportProgress: (idx, written, total) => {
+        const pct = Math.floor((written / total) * 100);
+        if (written % 65536 === 0 || written === total) {
+          appendTerminal(`[Flash] ${pct}% (${written}/${total} Bytes)\n`);
+          flashStatusEl.textContent = `Flash: ${pct}%`;
+        }
+      }
+    });
+  } catch (flashErr) {
+    appendTerminal(`[Flash-Fehler in writeFlash] ${flashErr.message}\n`);
+    throw flashErr;
+  }
+
+  appendTerminal("[Flash] Schreiben abgeschlossen\n");
+
+  flashStatusEl.textContent = "Flash: Reset…";
+  appendTerminal("[Flash] Reset ESP32\n");
+  try {
+    await esploader.hardReset();
+    appendTerminal("[Flash] Hard-Reset erfolgreich\n");
+  } catch (resetErr) {
+    appendTerminal("[Flash] Hard-Reset nicht verfügbar, nutze Soft-Reset\n");
+    try { 
+      await esploader.softReset(); 
+      appendTerminal("[Flash] Soft-Reset erfolgreich\n");
+    } catch (_) {
+      appendTerminal("[Flash] Bitte ESP32 manuell neu starten (Reset-Taste)\n");
+    }
+  }
+
+  await new Promise(res => setTimeout(res, 500));
+  appendTerminal("[Flash] ✓ Erfolgreich abgeschlossen! Firmware läuft.\n");
+}
+
+
+
+
+
+
+  
+
+
+
+
+
+
+
+
+
+
+
+
+  </script>
+</body>
+</html>
