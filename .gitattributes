@@ -1,0 +1,15 @@
+# Standard: alle Textdateien mit LF speichern
+* text eol=lf
+
+# JavaScript, HTML, CSS explizit als Text mit LF
+*.js   text eol=lf
+*.html text eol=lf
+*.css  text eol=lf
+*.md   text eol=lf
+
+# Binärdateien niemals anfassen
+*.bin  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
